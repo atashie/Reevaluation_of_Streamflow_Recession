@@ -1,0 +1,1805 @@
+################################################################################
+####    Part 0
+####    Load Necessary Packages
+################################################################################
+library(data.table)     # for fread, at least
+library(lubridate)
+library(conicfit)
+substrRight = function(x, n)    {   # for finding the last n characters in a string
+    substr(x, nchar(x)-n+1, nchar(x))
+}
+    
+recess_char = data.frame(       # for storing summary data for each gage
+    gage = integer(),
+    region = character(),
+    allmod_slope = double(),	# start of cloud based slope parameters
+    uppmod_slope = double(),
+    lowmod_slope = double(),
+    kirch_slope = double(),
+    dly_med_slope = double(),   # last of cloud based slope parameters 
+    dly_med_slope = double(),   # last of cloud based slope parameters 
+    event_med_slope = double(),
+    nonlinear_frac_shapwilk = double(),
+    convex_frac_esum = double(), 
+    convex_frac_slpvslp = double(),
+    convex_frac_pwrlg = double(),
+	convex_frac_circ = double(),
+	convex_frac_sqdvsrt = double(),
+	tot_convex = double(),
+	tot_concav = double(),
+    tot_events = double(),
+	fltcav = double(),
+	fltnth = double(),
+	fltvex = double(),
+	okycav = double(),
+	okynth = double(),
+	okyvex = double(),
+	stpcav = double(),
+	stpnth = double(),
+	stpvex = double(),
+	sd_med_event = double(),
+	
+		# seasonal analysis added at reviewer request
+	wint_rpc = double(),				# wint = dec, jan, feb
+	wint_rmed = double(),
+	wint_r95 = double(),
+	wint_r5 = double(),
+	wint_convex_pct = double(),
+	wint_sd_med_event = double(),
+		
+	spri_rpc = double(),				# spri = mar, apr, may
+	spri_rmed = double(),
+	spri_r95 = double(),
+	spri_r5 = double(),
+	spri_convex_pct = double(),
+	spri_sd_med_event = double(),
+		
+	summ_rpc = double(),				# summ = jun, jul, aug
+	summ_rmed = double(),
+	summ_r95 = double(),
+	summ_r5 = double(),
+	summ_convex_pct = double(),
+	summ_sd_med_event = double(),
+	
+	fall_rpc = double(),				# fall = sep, oct, nov
+	fall_rmed = double(),
+	fall_r95 = double(),
+	fall_r5 = double(),
+	fall_convex_pct = double(),
+	fall_sd_med_event = double(),
+	
+    stringsAsFactors = FALSE)
+
+    # read in a txt file with the names (and ref / non-ref status) of every gage in CONUS
+setwd("~")#
+all_gages = read.csv("conterm_bas_classif.txt", colClasses = c("STAID" = "character", "AGGECOREGION" = "character")) #   read in GAGES-II database
+ref_gages = which(all_gages$CLASS == "Ref")     #   identify which basins are chategorized as reference basins
+run = 0
+
+start_date = "1900-01-01"                   
+end_date = "2018-01-01"
+
+	# Initializing Scenarios
+decreasing_dQ = TRUE		# must -dQ decrease? if not, then dQ must always be
+minRecessLength = 5		# minimum days for recession
+rm_Ith = 0			# remove the first I days of recession
+rm_Nth = 0			# remove the last N days of recession
+minRecessions = 50
+long10	=	FALSE		# only identifying the longest 10 events
+
+	# defining objects
+slope = 2
+intercept = 1
+
+
+################################################################################
+####    Part 1
+####    Read in USGS Data
+################################################################################
+while (run < length(ref_gages)) {
+#while (run < 12)    {     #### fewer examples for testing
+    run = run + 1
+    if(run %% 10 == 0) print(run)
+    gage_number = all_gages[ref_gages[run], "STAID"]
+    recess_char[run, "gage"] = gage_number
+    recess_char[run, "region"] = all_gages[ref_gages[run] , "AGGECOREGION"]
+   
+   
+    USGS_webpage = paste0("https://waterdata.usgs.gov/nwis/dv?cb_00060=on&format=rdb&site_no=",
+        gage_number, "&referred_module=sw&period=&begin_date=",
+        start_date, "&end_date=", end_date)
+   
+        # read in the initial ### lines from the webpage, then find the line where the comment characters actually end
+            # the problem is that there are two lines of header on the webpage following a somewhat random number of lines of comment characters, while the number and order of columns is also indeterminite
+    max_lines_to_read = 100         # 50 lines is probably safe, but whatever
+    gage_header_data = scan(USGS_webpage, what = character(), nmax = max_lines_to_read, sep = "\n")
+    if (NROW(gage_header_data) == 100)  {
+        init_char = "#"                 # looking for the first line that doesnt start with "#"... prob not efficient
+        increment = 0                   # ultimately tells where fread should start reading in data (+2)
+        while (init_char == "#")    {
+            increment = increment + 1
+            init_char = substr(gage_header_data[increment], 1, 1)
+            }
+       
+        col_names = strsplit(gage_header_data[increment], "\t")        # saving the column names for later
+        q_col_num = which(substrRight(col_names[[1]], 11) == "00060_00003")[1] # identifying q using the final 11 chars of the column name
+            #sometimes streamflow (00060_00003) is given in multiple units (e.g., cfs and cms) or by multiple gages, so later we identify which has the longest period of record and use that one
+            # !!!!! the code currently just uses the first instance.... need to change in future
+        if(!is.na(q_col_num))   {
+           
+                # use fread to skip the first XX lines and headers to read in the actual data
+            gage_data = fread(USGS_webpage, header = FALSE, skip = increment + 1, na.strings=c("NA", "Ssn", "Ice", "Eqp", "Bkw", "Dry", "Zfl", "Pr", "Rat", "Fld", "Dis", "--", "Mnt", "***")) # na.strings should change all strings I've listed to NA value, which is fine since we simply won't use that time period
+            colnames(gage_data) = col_names[[1]]
+           
+           
+                # creating a new data frame using only streamflow, change in streamflow, and dates
+            streamy = cbind.data.frame(as.Date(gage_data$datetime), gage_data[, q_col_num, with = FALSE])
+            colnames(streamy) = c("Date", "origQ")
+            streamy$origQ = as.numeric(streamy$origQ)
+            streamy$dQ = NA                    # creating a column for dQ
+            streamy$dQ[1:(length(streamy$origQ)-1)] = diff(streamy$origQ)
+            minDeltaQ = min(abs(streamy$dQ[which(streamy$dQ != 0)]), na.rm=TRUE)
+            streamy$Q = streamy$origQ + streamy$dQ / 2    #finding the mean value between Q measurements
+           
+           
+            ################################################################################
+            ####    Part 2
+            ####    Identifying Recession Events
+            ################################################################################
+           
+                #    identifying days where recession is occurring
+            days_to_remove = unique(c(
+                which(streamy$dQ >= 0),    # removes days of non-decreasing streamflow
+                which(streamy$Q == 0),    #    removes days of zero streamflow
+                if(decreasing_dQ){
+                    c(which(diff(streamy$dQ) <= 0) + 1)    #removes days where rate of streamflow decay increases
+                } else    {
+                    c(which(abs(streamy$dQ) == minDeltaQ))
+                },
+                which(is.na(streamy$Q)),    # removes days of missing streamflow values
+                which(is.na(streamy$dQ))    # removes days of missing dQ values, i.e. the final day
+                ))               
+            stream_recess = streamy[!days_to_remove, ]
+           
+                # identifying unique recession events, and removing all other days
+    ####    <--        setting the minimum consecutive days for a recession event to be included
+            recess_length = minRecessLength    # the days of monontonic recession required to be considered an event
+            lagdiff = diff(stream_recess$Date, lag = recess_length)
+            longrecess = which(lagdiff == recess_length)
+            keepers = NULL
+            for(i in (rm_Ith):(recess_length-rm_Nth))    {
+            keepers = c(keepers, longrecess + i)
+            }
+
+            strmfl = stream_recess[sort(unique(keepers)),]    # new matrix only including periods of long recession
+
+           
+                # naming unique periods of extended recession
+            counter = rle(as.vector(c(diff(strmfl$Date),1)))$lengths # counting run lengths of successive days
+
+       
+    ##    <-- set variable tot_events
+    recess_char[run, "tot_events"] = ceiling(length(counter) / 2)
+
+    ####    <--        setting the minimum number of recession events before we count a
+            min_num_events = minRecessions        #       setting the min number of captured events required to proceed with analysis
+            if(length(counter) >= min_num_events * 2)   {       # x2 because the counter takes two cells for one event
+   
+                recess_events = NULL
+                for(i in seq(from = 1, to = length(counter) - 1, by = 2))    {
+                    recess_events = c(recess_events, counter[i] + counter[i + 1])
+                    }
+                recess_events = c(recess_events, last(counter))
+                strmfl$event = rep(1:length(recess_events), recess_events)
+   
+            if(long10)    {
+                # identifying specific recession events
+                recessPeriods = rle(strmfl$event)
+                recessValuesSrtd = recessPeriods$values[order(recessPeriods$lengths, decreasing=TRUE)] # sorting the recession periods by length of recession (days)
+
+                strmfl$long = FALSE
+                strmfl$long[which(strmfl$event %in% head(recessValuesSrtd, 10))] = TRUE    #identifying the (x) longest periods of recession
+            }    else    {strmfl$long = TRUE}
+			
+   
+                ################################################################################
+                ####    Part 3
+                ####    Recession Analysis
+                ################################################################################
+               
+               
+                    # log transformations of the data
+                strmfl$lg_dQ = log10(abs(strmfl$dQ))
+                strmfl$lg_Q = log10(strmfl$Q)
+               
+                    # linear model for all data
+                allmod = lm(strmfl$lg_dQ ~ strmfl$lg_Q)
+    ##    <-- set variable allmod_slope
+    recess_char[run, "allmod_slope"] = allmod$coef[slope]
+
+   
+                    # Kirchner regression
+                nmbrOfBins = 15     # number of bins for Kirch and BrutnNieb
+                nPerBin = floor(length(strmfl$Q) / nmbrOfBins)
+                xtrs = length(strmfl$Q) %% nmbrOfBins    # extra data points (the remainder from division)
+                if(xtrs > 0)    {
+                    longs = rep(1:xtrs, each=nPerBin+1)    # some bins get one extra data point (I chose the earlier bins for no particular reason)
+                    shorts = rep((xtrs+1):nmbrOfBins, each=nPerBin)    # bins which don't get the extra data point
+                    strmfl$bin[order(strmfl$Q)] = c(longs,shorts)    # new column which identifies which bin each data point goes into
+                    } else    {
+                    strmfl$bin[order(strmfl$Q)] = rep(1:nmbrOfBins, each = nPerBin)
+                }
+                medQs = NULL
+                meddQs = NULL
+                numBotVals = floor(nPerBin * 0.05)    # for selecting the events which form the upper/lower envelope... at 0.1 we'd theoretically have 5% of values below the envelope
+                minQs = NULL                        # these values aren't for Kirchner regression, but for Brut and Nieb below
+                mindQs = NULL
+                for(i in 1:nmbrOfBins)    {
+                    valLocs = which(strmfl$bin == i)
+                    medQs[i] = median(strmfl[valLocs,"lg_Q"][[1]])
+                    meddQs[i] = median(strmfl[valLocs,"lg_dQ"][[1]])
+                    minQs[i] = median(head(sort(strmfl[valLocs,"lg_Q"][[1]]), numBotVals))
+                    mindQs[i] = median(head(sort(strmfl[valLocs,"lg_dQ"][[1]]), numBotVals))
+                }
+                krchReg = lm(meddQs ~ medQs)
+    ##    <-- set variable kirch_slope
+    recess_char[run, "kirch_slope"] = krchReg$coef[slope]
+
+
+                    #    Brut and Nieb regression
+                minModL = nmbrOfBins - 5    # if 5 is the fewest points necessary for a regression
+                lowEnvSlp = NULL
+                uppEnvSlp = NULL
+                k = 1
+                for(j in 5:minModL)    {    # determine a knickpoint for separating the upper from the lower envelope
+                    lowEnvSlp[k] = lm(mindQs[1:j] ~ minQs[1:j])$coef[[2]]
+                    uppEnvSlp[k] = lm(mindQs[j:nmbrOfBins] ~ minQs[j:nmbrOfBins])$coef[[2]]
+                    k = k + 1
+                }
+                maxDiffIter = which.max(uppEnvSlp - lowEnvSlp)
+                lowEnvReg = lm(mindQs[1:(5+maxDiffIter)] ~ minQs[1:(5+maxDiffIter)])
+                uppEnvReg = lm(mindQs[(5+maxDiffIter):nmbrOfBins] ~ minQs[(5+maxDiffIter):nmbrOfBins])
+    ##    <-- set variables uppmod_slope and lowmod_slope
+    recess_char[run, "uppmod_slope"] = uppEnvReg$coef[slope]
+    recess_char[run, "lowmod_slope"] = lowEnvReg$coef[slope]
+ 
+   
+                    # linear models for each recession event; also contrasting power law models
+                eventmod = list()
+                begineventmod = list()
+                endeventmod = list()
+                expeventmod = list()
+                logeventmod = list()
+                circlemod = NULL
+                medevent_lg_Q = NULL
+                sqdeventmod = list()
+                srteventmod = list()
+                j = 0
+                for(i in unique(strmfl$event[strmfl$long]))    {
+                    j = j + 1
+                    this_event = which(strmfl$event == i)
+                    eventmod[[j]] = lm(strmfl$lg_dQ[this_event] ~ strmfl$lg_Q[this_event])               
+                    middleofevent = length(this_event) / 2
+                    begineventmod[[j]] = lm(strmfl$lg_dQ[this_event[1:floor(middleofevent)]] ~ strmfl$lg_Q[this_event[1:floor(middleofevent)]])
+                    endeventmod[[j]] = lm(strmfl$lg_dQ[this_event[ceiling(middleofevent):length(this_event)]] ~ strmfl$lg_Q[this_event[ceiling(middleofevent):length(this_event)]])
+                    expeventmod[[j]] = lm(exp(strmfl$lg_dQ[this_event]) ~ strmfl$lg_Q[this_event])
+                    modified_lg_Q = strmfl$lg_Q[this_event] + 100
+                    modified_lg_dQ = strmfl$lg_dQ[this_event] + 100
+                    logeventmod[[j]] = lm(log(modified_lg_dQ) ~ modified_lg_Q) # this is getting sloppy; trying to create a logarithmic model, but there are negative values, so I'm shifting the data into positive space by adding a large number
+                    circlemod = rbind(circlemod, CircleFitByKasa(cbind(strmfl$lg_Q[this_event], strmfl$lg_dQ[this_event])))
+                    medevent_lg_Q[j] = median(strmfl$lg_Q[this_event])
+                    sqdeventmod[[j]] = lm(strmfl$lg_dQ[this_event]^2 ~ strmfl$lg_Q[this_event])
+                    srteventmod[[j]] = lm(modified_lg_dQ^.5 ~ modified_lg_Q)
+                }
+
+                    # identifying values related to specific events, for summary
+                yintercept = 1
+                slope = 2
+                   
+                nonlinear_shapwilk = NULL
+                cvx_u_sum  =  NULL
+                slpvslp = NULL
+                expvlog = NULL
+                circlocsum = NULL
+                sqdvsrt = NULL
+				totconvex = NULL
+                totconcav = NULL
+				eventmonth = NULL
+				eventslope = NULL
+				
+   
+                cavvex = NULL    # identifying which individual events are overly steep/flat/okay and concav/convex/neither
+                fltstp = NULL
+                noise = .1    # setting the allowable wiggle around the true value of point cloud regression slope, +/- a percentage of its actual value
+                allmodslp = allmod$coef[2]
+                allmodrng = c(allmodslp - allmodslp*noise, allmodslp + allmodslp*noise)
+               
+               
+               
+                mod_length = length(eventmod)
+                mod_df = data.frame(event = numeric(mod_length), yintercept = numeric(mod_length),
+                    slope = numeric(mod_length), month = numeric(mod_length),
+                    Date = as.Date(mod_length, origin=Sys.Date()))
+                for (i in 1:mod_length)    {
+                    mod_df[i,1] = i
+                    mod_df[i,2] = eventmod[[i]]$coefficient[yintercept]
+                    mod_df[i,3] = eventmod[[i]]$coefficient[slope]
+                    mod_df[i,5] = median(strmfl$Date[which(strmfl$event == i)])
+
+                        # assessing (non)linearity using the shapiro-wilks test for normality
+                    the_residuals = eventmod[[i]]$res   
+                    if(!all(the_residuals==0)){    # if dQ is not required to decrease (above) then sometimes there is a perfect model fit; this helps resolve where that is the case, ie the residuals = 0
+                        shap_test = shapiro.test(the_residuals)
+                        nonlinear_shapwilk[i] = ifelse(shap_test$p.value < 0.05, 1, 0)
+                    }
+
+                        # assessing convexity using the first and last residual
+                    firstandlast = sum(first(the_residuals), last(the_residuals))   # if first and last residuals are negative, then concave up... is this reasonable?
+                    cvx_u_sum[i] = ifelse(firstandlast < 0, 1, 0)   # assigning a value of 1 to convex down and 0 to convex up
+
+                        # for collecting events where the slope is greater at the end than the beginning; i.e. a convex up curve
+                    bgnslp = begineventmod[[i]]$coefficient[slope]
+                    endslp = endeventmod[[i]]$coefficient[slope]           
+                    slpvslp[i] = ifelse(endslp > bgnslp, 1, 0)
+
+                        # for collecting events where an exponential model fits the data better than a logarithmic model
+                    expmodr = summary(expeventmod[[i]])$adj.r.squared
+                    logmodr = summary(logeventmod[[i]])$adj.r.squared
+                    expvlog[i] = ifelse(expmodr > logmodr, 1, 0)
+
+                        # assessing convexity using the centroid of a 'circle'
+                    circlocsum[i] = ifelse(circlemod[i,1] > medevent_lg_Q[i], 1, 0)               
+
+                        # collecting events where a squared model fits the data better than a square root model
+                    sqdmodr = summary(sqdeventmod[[i]])$adj.r.squared
+                    srtmodr = summary(srteventmod[[i]])$adj.r.squared
+                    sqdvsrt[i] = ifelse(sqdmodr > srtmodr, 1, 0)               
+
+                        # identifying convexity/concavity based an perponderance of models
+                    totconvex[i] = ifelse((cvx_u_sum[i] + slpvslp[i] + expvlog[i] + sqdvsrt[i] + circlocsum[i]) >=4, 1, 0)
+                    totconcav[i] = ifelse((cvx_u_sum[i] + slpvslp[i] + expvlog[i] + sqdvsrt[i] + circlocsum[i]) <=1, 1, 0)
+                   
+                        # assigning each recession event to 1 of 9 categories, based on steep/flat/okay and concav/convex/neither
+                    eventslp = mod_df[i,3]
+                    fltstp[i] = ifelse(eventslp < allmodrng[1], 1, 2)
+                    if(eventslp > allmodrng[2])    fltstp[i] = 3
+                   
+                    cavvex[i] = ifelse(totconcav[i] == 1, 0, 3)
+                    if(totconvex[i] == 1) cavvex[i] = 6
+                
+								# creating a vector to identify the month of initiationof each event
+#					eventmonth[j] = month(strmfl$Date[this_event][1])
+#					strmfl$month[this_event] = rep(month(strmfl$Date[this_event][1]), length(this_event))	# defining months for events for later use
+					
+					}
+				
+
+
+					recess_char[run, "sd_med_event"] = sd(mod_df$slope)
+
+								#########################################
+								####  added for Reviewers seasonal analysis  ####
+								##########################################
+									# defining the seasons...
+								mod_df$month  = month(mod_df$Date)
+								
+								winter = c(12,1,2)
+								spring = c(3,4,5)
+								summer = c(6,7,8)
+								fall = c(9,10,11)
+
+								wint_events = which(mod_df$month %in% winter)
+								spri_events = which(mod_df$month %in% spring)
+								summ_events = which(mod_df$month %in% summer)
+								fall_events = which(mod_df$month %in% fall)
+							   
+							   mod_df$convex = totconvex
+
+									# seasonal data info
+								min_events = 5	# setting minimum number of events for before counting seasonal recession
+								if(length(wint_events > min_events))	{
+#									wintmod = lm(strmfl$lg_dQ[wint_events] ~ strmfl$lg_Q[wint_events])
+					recess_char[run, "wint_rpc"] = wintmod$coef[slope]
+					recess_char[run, "wint_rmed"] = median(mod_df$slope[wint_events])
+					recess_char[run, "wint_r95"] = quantile(mod_df$slope[wint_events], .95)
+					recess_char[run, "wint_r5"] = quantile(mod_df$slope[wint_events], .05)
+					recess_char[run, "wint_convex_pct"] = sum(mod_df$convex[wint_events], na.rm=TRUE) / length(wint_events)
+					recess_char[run, "wint_sd_med_event"] = sd(mod_df$slope[wint_events])
+								}
+								if(length(spri_days > min_events))	{
+#									sprmod = lm(strmfl$lg_dQ[spri_events] ~ strmfl$lg_Q[spri_events])
+					recess_char[run, "spri_rpc"] = sprimod$coef[slope]
+					recess_char[run, "spri_rmed"] = median(mod_df$slope[spri_events])
+					recess_char[run, "spri_r95"] = quantile(mod_df$slope[spri_events], .95)
+					recess_char[run, "spri_r5"] = quantile(mod_df$slope[spri_events], .05)
+					recess_char[run, "spri_convex_pct"] = sum(mod_df$convex[spri_events], na.rm=TRUE) / length(spri_events)
+					recess_char[run, "spri_sd_med_event"] = sd(mod_df$slope[spri_events])
+								}
+								if(length(summ_events > min_events))	{
+#									summmod = lm(strmfl$lg_dQ[summ_events] ~ strmfl$lg_Q[summ_events])
+					recess_char[run, "summ_rpc"] = summmod$coef[slope]
+					recess_char[run, "summ_rmed"] = median(mod_df$slope[summ_events])
+					recess_char[run, "summ_r95"] = quantile(mod_df$slope[summ_events], .95)
+					recess_char[run, "summ_r5"] = quantile(mod_df$slope[summ_events], .05)
+					recess_char[run, "summ_convex_pct"] = sum(mod_df$convex[summ_events], na.rm=TRUE) / length(summ_events)
+					recess_char[run, "summ_sd_med_event"] = sd(mod_df$slope[summ_events])
+								}
+								if(length(fall_events > min_events))	{
+#									fallmod = lm(strmfl$lg_dQ[fall_events] ~ strmfl$lg_Q[fall_events])
+					recess_char[run, "fall_rpc"] = fallmod$coef[slope]
+					recess_char[run, "fall_rmed"] = median(mod_df$slope[fall_events])
+					recess_char[run, "fall_r95"] = quantile(mod_df$slope[fall_events], .95)
+					recess_char[run, "fall_r5"] = quantile(mod_df$slope[fall_events], .05)
+					recess_char[run, "fall_convex_pct"] = sum(mod_df$convex[fall_events], na.rm=TRUE) / length(fall_events)
+					recess_char[run, "fall_sd_med_event"] = sd(mod_df$slope[fall_events])
+										}
+		 		
+				
+               
+			   
+               
+    ##    <-- set variables on nonlinearity and convexity
+				totev = ifelse(long10, 10, recess_char[run, 'tot_events'])	# assigning the total number of events
+
+				recess_char[run, "nonlinear_frac_shapwilk"] = sum(nonlinear_shapwilk, na.rm=TRUE) / totev    #fraction of events whose residuals fail the shap wilk test at 95% confidence; i.e., the residuals are not normally distributed and therefore the data is not well represented by a linear model
+                recess_char[run, "convex_frac_esum"] = sum(cvx_u_sum) / totev   			# fraction of events which are convex down
+                recess_char[run, "convex_frac_slpvslp"] = sum(slpvslp) / totev   			# fraction of events whose slope increases with time
+                recess_char[run, "convex_frac_pwrlg"] = sum(expvlog) / totev				# fraction of events for which an exponential model is a better fit than a logarithmic model
+                recess_char[run, "convex_frac_circ"] = sum(circlocsum) / totev				# fraction of events which are convex down
+                recess_char[run, "convex_frac_sqdvsrt"] = sum(sqdvsrt) / totev				# fraction of events for which a squared model works is a better fit than a square root model
+                recess_char[run, "tot_convex"] = sum(totconvex)                             # total number of events for which 4 out of 5 tests show convexity
+                recess_char[run, "tot_concav"] = sum(totconcav)                             # total number of events for which 4 out of 5 tests show concavity       
+               
+                shpsum = fltstp + cavvex
+                recess_char[run, 'fltcav'] = length(which(shpsum == 1)) / totev
+                recess_char[run, 'okycav'] = length(which(shpsum == 2)) / totev
+                recess_char[run, 'stpcav'] = length(which(shpsum == 3)) / totev
+                recess_char[run, 'fltnth'] = length(which(shpsum == 4)) / totev
+                recess_char[run, 'okynth'] = length(which(shpsum == 5)) / totev
+                recess_char[run, 'stpnth'] = length(which(shpsum == 6)) / totev
+                recess_char[run, 'fltvex'] = length(which(shpsum == 7)) / totev
+                recess_char[run, 'okyvex'] = length(which(shpsum == 8)) / totev
+                recess_char[run, 'stpvex'] = length(which(shpsum == 9)) / totev
+
+
+               
+				
+						#### added at reviewer request
+				################################################################################
+                ####    Part 4
+                ####    Finding median values
+                ################################################################################
+               
+                    # Julian day
+                days_of_window = 30      # this will include x days on either side of the chosen day for calculating the median value
+                strmfl$julday = yday(strmfl$Date)
+                mod_df$julday = yday(mod_df$Date)
+               
+               
+                xmeds = NULL    # for finding the median value of slopes of individual events smoothed by day... but is it necessary?
+                ymeds = NULL
+                slopemeds = NULL
+                for (m in 1:366)    {
+                    n = m + 366
+                    p = m - 366
+                       
+                    the_days = which(strmfl$julday >= m - days_of_window & strmfl$julday <= m + days_of_window)
+                    the_days = c(the_days, which(strmfl$julday >= n - days_of_window))
+                    the_days = unique(c(the_days, which(strmfl$julday <= p + days_of_window)))
+                       
+                    the_days = which(strmfl$julday >= m & strmfl$julday <= n)
+                    all_exes = strmfl[the_days, "lg_Q"]
+                    all_whys = strmfl[the_days, "lg_dQ"]
+               
+                    xmed = median(all_exes$lg_Q, na.rm = TRUE)
+                    ymed = median(all_whys$lg_dQ, na.rm = TRUE)
+                    xmeds = c(xmeds, xmed)
+                    ymeds = c(ymeds, ymed)
+                   
+                    the_days_moddf = which(mod_df$julday >= m & mod_df$julday <= n)
+                    all_slopes = mod_df[the_days_moddf, "slope"]
+                   
+                    slopemed = median(all_slopes, na.rm = TRUE)
+                    slopemeds = c(slopemeds, slopemed)
+                }
+               
+                days_to_fltr = 60       # the number of days applied to the filter
+                daylist = c((366 - days_to_fltr):366, 1:366, 1:days_to_fltr)
+                dailymeds = matrix(c(xmeds[daylist], ymeds[daylist], slopemeds[daylist]),
+                    ncol = 3, dimnames = list(NULL, c("Q", "dQ", "slope")))
+                   
+                fltr_vals = c(log(1:days_to_fltr),  # weighting the values with log
+                    log(days_to_fltr + 1),
+                    log(days_to_fltr:1))
+                fltr_sclr = fltr_vals / sum(fltr_vals)
+                fltrd_meds = matrix(data = NA, nrow = 366, ncol = 5,   
+                    dimnames = list(NULL, c("Q", "dQ", "slope", "yint_avg", "yint_dyn")))
+                for (m in 1:366)    {
+                    n = m + days_to_fltr * 2
+                   
+                    fltrd_meds[m, "Q"] = sum(dailymeds[m:n, "Q"] * fltr_sclr, na.rm = TRUE)
+                    fltrd_meds[m, "dQ"] = sum(dailymeds[m:n, "dQ"] * fltr_sclr, na.rm = TRUE)
+                    fltrd_meds[m, "slope"] = sum(dailymeds[m:n, "slope"] * fltr_sclr, na.rm = TRUE)
+                }
+               
+               
+   
+    ##    <-- set variables on nonlinearity and convexity
+                recess_char[run, "dly_med_slope"] = lm(fltrd_meds[, "dQ"] ~ fltrd_meds[, "Q"])$coeff[slope]
+                recess_char[run, "event_med_slope"] = median(mod_df$slope)
+   
+         
+		 
+		 
+				
+		 
+		 
+            }   
+        }
+    }
+}
+
+
+
+setwd("~")
+write.csv(recess_char, "recessionOutput_primaryAnalysis_WRR2019.csv")
+
+
+
+
+
+################################################################################
+####	Section 2
+####	Making Plotty Plots
+################################################################################
+
+	############################################################################
+	####	Part I
+	####	Preliminary Analysis Plots
+	############################################################################
+	ggplot(data = recess_char,
+		aes(x = region,
+		y = as.numeric(clockwise))) +
+	  stat_summary(fun.y = mean, geom = "point")
+	  
+	ggplot(data = recess_char,
+		aes(x = Q_min, y = dQ_min, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+		
+	ggplot(data = recess_char,
+		aes(x = convex_frac_esum, y = convex_frac_slpvslp, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+
+	ggplot(data = recess_char,
+		aes(x = convex_frac_circ, y = convex_frac_pwrlg, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+		
+	ggplot(data = recess_char,
+		aes(x = convex_frac_sqdvsrt, y = convex_frac_pwrlg, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+		
+	ggplot(data = recess_char,
+		aes(x = convex_frac_pwrlg, y = convex_frac_slpvslp, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+
+	ggplot(data = recess_char,
+		aes(x = convex_frac_sqdvsrt, y = convex_frac_slpvslp, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+		
+	ggplot(data = recess_char,
+		aes(x = event_med_slope, y = convex_frac_circ, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+		
+	ggplot(data = recess_char,
+		aes(x = event_med_slope, y = allmod_slope, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+
+	ggplot(data = recess_char,
+		aes(x = event_med_slope, y = dly_med_slope, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+
+	ggplot(data = recess_char,
+		aes(x = allmod_slope, y = dly_med_slope, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+
+	ggplot(data = recess_char,
+		aes(x = uppmod_slope, y = event_med_slope, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+
+	ggplot(data = recess_char,
+		aes(x = lowmod_slope, y = dly_med_slope, colour = region)) + #, shape = clockwise)) +
+		geom_point()
+
+		
+		
+############################################################################
+####	Part II
+####	Recession plots for individual watersheds
+############################################################################
+require(viridis)	# color palette for the color blind
+
+strmEx = strmfl			# using stream analysis data from the last run of the main loop in Section 1
+	# defining the colors and symbols used for each type of regression
+theCols = viridis(200)
+pointCols = "grey80";	pointPch = 5 #20
+hlghtCols = "grey20";	hlghtPch = 10
+boxCols = "grey30"	;	boxPch = 0
+pcCol = "darkgreen"		#theCols[1]
+kCol = "darkorchid4"			#theCols[40]
+uppCol = "orangered3"	#theCols[70]
+lowCol = "orangered4"		#theCols[90]
+julCol = "chocolate4"	
+	
+	###################
+	#### cloud analysis
+	###################
+	#	point cloud regression		
+	pcReg = lm(strmEx$lg_dQ ~ strmEx$lg_Q)	# point cloud regression
+
+	#	Kirchner regression
+	nmbrOfBins = 15 	# number of bins for Kirch and BrutnNieb 
+	nPerBin = floor(length(strmEx$lg_Q) / nmbrOfBins)
+	xtrs = length(strmEx$lg_Q) %% nmbrOfBins	# extra data points (the remainder from division)
+	longs = rep(1:xtrs, each=nPerBin+1)	# some bins get one extra data point (I chose the earlier bins for no particular reason)
+	shorts = rep((xtrs+1):nmbrOfBins, each=nPerBin)	# bins which don't get the extra data point
+	if(xtrs > 0)	{
+		longs = rep(1:xtrs, each=nPerBin+1)	# some bins get one extra data point (I chose the earlier bins for no particular reason)
+		shorts = rep((xtrs+1):nmbrOfBins, each=nPerBin)	# bins which don't get the extra data point
+		strmEx$bin[order(strmEx$Q)] = c(longs,shorts)	# new column which identifies which bin each data point goes into
+		} else	{
+		strmEx$bin[order(strmEx$Q)] = rep(1:nmbrOfBins, each = nPerBin)
+	}
+
+	medQs = NULL
+	meddQs = NULL
+	numBotVals = floor(nPerBin * 0.05)	# for selecting the events which form the upper/lower envelope... at 0.1 we'd theoretically have 5% of values below the envelope
+	minQs = NULL			
+	mindQs = NULL
+	for(i in 1:nmbrOfBins)	{
+		valLocs = which(strmEx$bin == i)
+		medQs[i] = median(strmEx[valLocs,"lg_Q"][[1]])
+		meddQs[i] = median(strmEx[valLocs,"lg_dQ"][[1]])
+		minQs[i] = median(head(sort(strmEx[valLocs,"lg_Q"][[1]]), numBotVals))
+		mindQs[i] = median(head(sort(strmEx[valLocs,"lg_dQ"][[1]]), numBotVals))
+	}
+
+	krchReg = lm(meddQs ~ medQs)
+
+	#	Brut and Nieb regression
+	minModL = nmbrOfBins - 5	# if 5 is the fewest points necessary for a regression
+	lowEnvSlp = NULL
+	uppEnvSlp = NULL
+	k = 1
+	for(j in 5:minModL)	{	# determine a knickpoint for separating the upper from the lower envelope
+		lowEnvSlp[k] = lm(mindQs[1:j] ~ minQs[1:j])$coef[[2]]
+		uppEnvSlp[k] = lm(mindQs[j:nmbrOfBins] ~ minQs[j:nmbrOfBins])$coef[[2]]
+		k = k + 1
+	}
+	maxDiffIter = which.max(uppEnvSlp - lowEnvSlp)
+	lowEnvReg = lm(mindQs[1:(5+maxDiffIter)] ~ minQs[1:(5+maxDiffIter)])
+	uppEnvReg = lm(mindQs[(5+maxDiffIter):nmbrOfBins] ~ minQs[(5+maxDiffIter):nmbrOfBins])
+
+
+	#	Julian day regression
+    days_of_window = 30      # this will include x days on either side of the chosen day for calculating the median value
+	strmEx$julday = yday(strmEx$Date)
+			
+    xmeds = NULL
+    ymeds = NULL
+    slopemeds = NULL
+    for (m in 1:366)	{	# creating three moving windows based on m n and p... sloppy but works
+      	n = m + 366
+		p = m - 366
+							
+       	the_days = which(strmEx$julday >= m - days_of_window & strmEx$julday <= m + days_of_window)
+		the_days = c(the_days, which(strmEx$julday >= n - days_of_window))
+		the_days = unique(c(the_days, which(strmEx$julday <= p + days_of_window)))
+		all_exes = strmEx[the_days, "lg_Q"]
+       	all_whys = strmEx[the_days, "lg_dQ"]
+                
+       	xmed = median(all_exes$lg_Q, na.rm = TRUE)
+       	ymed = median(all_whys$lg_dQ, na.rm = TRUE)
+       	xmeds = c(xmeds, xmed)
+       	ymeds = c(ymeds, ymed)
+    }
+	julReg = lm(ymeds ~ xmeds)
+		# continuation of original method of smoothing... not sure if necessary here
+#        days_to_fltr = 60       # the number of days applied to the filter
+#        daylist = c((366 - days_to_fltr):366, 1:366, 1:days_to_fltr)
+#        dailymeds = matrix(c(xmeds[daylist], ymeds[daylist], slopemeds[daylist]),
+#			ncol = 2, dimnames = list(NULL, c("Q", "dQ")))
+#                    
+#        fltr_vals = c(log(1:days_to_fltr),  # weighting the values with log
+#            log(days_to_fltr + 1),
+#            log(days_to_fltr:1))
+#        fltr_sclr = fltr_vals / sum(fltr_vals)
+#        fltrd_meds = matrix(data = NA, nrow = 366, ncol = 2,    
+#			dimnames = list(NULL, c("Q", "dQ")))
+#        for (m in 1:366)	{
+#			n = m + days_to_fltr * 2
+                	
+#			fltrd_meds[m, "Q"] = sum(dailymeds[m:n, "Q"] * fltr_sclr, na.rm = TRUE)
+#			fltrd_meds[m, "dQ"] = sum(dailymeds[m:n, "dQ"] * fltr_sclr, na.rm = TRUE)
+#        }
+#		julReg2 = lm(fltrd_meds[,'dQ'] ~ fltrd_meds[,'Q'])
+
+
+
+		
+	# finding value ranges for more aesthetic plotting
+	Qsum = summary(exp(strmEx$lg_Q))
+	Qlabs = c(ceiling(Qsum['Min.']), ceiling(Qsum['Median']), floor(Qsum['Max.']))
+	dQsum = summary(exp(strmEx$lg_dQ))
+	dQlabs = c(ceiling(dQsum['Min.']), ceiling(dQsum['Median']), floor(dQsum['Max.']))
+
+	# poin cloud plots
+	#png(paste0(gage_number,"_PCR_LM.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(strmEx$lg_Q, strmEx$lg_dQ, axes=FALSE, xlab="Q (cfs)", ylab="-dQ/dt (cfs)", main = gage_number,
+		col=pointCols, pch=pointPch)
+	axis(1, at=log(Qlabs), lab=Qlabs, cex=2) 
+	axis(2, at=log(dQlabs), lab=dQlabs, cex=2) 
+	abline(pcReg$coef[[1]], pcReg$coef[[2]], col=pcCol, lwd=9)
+	text(x=quantile(strmEx$lg_Q, .9), y=quantile(strmfl$lg_dQ,.05),
+		paste0("b=", round(pcReg$coef[[2]], 3)), cex=1.5, col=pcCol)
+	dev.off()
+			
+
+	#png(paste0(gage_number,"_PCR_Kirch.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(strmEx$lg_Q, strmEx$lg_dQ, axes=FALSE, xlab="Q (cfs)", ylab="-dQ/dt (cfs)", main = gage_number,
+		col=pointCols, pch=pointPch)
+	axis(1, at=log(Qlabs), lab=Qlabs) 
+	axis(2, at=log(dQlabs), lab=dQlabs) 
+	points(medQs, meddQs, col=boxCols, lwd=2, pch=boxPch, cex=1.5)
+	abline(krchReg$coef[[1]], krchReg$coef[[2]], col=kCol, lwd=9) 
+	text(x=quantile(strmEx$lg_Q, .9), y=quantile(strmfl$lg_dQ,.05),
+		paste0("b=", round(krchReg$coef[[2]], 3)), cex=1.5, col=kCol)
+	dev.off()
+
+
+	#png(paste0(gage_number,"_PCR_Brut.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(strmEx$lg_Q, strmEx$lg_dQ, axes=FALSE, xlab="Q (cfs)", ylab="-dQ/dt (cfs)", main = gage_number,
+		col=pointCols, pch=pointPch)
+	axis(1, at=log(Qlabs), lab=Qlabs) 
+	axis(2, at=log(dQlabs), lab=dQlabs) 	
+	points(minQs, mindQs, col=boxCols, lwd=2, pch=boxPch, cex=1.5, bg='grey95')
+	lines(minQs[1:(5+maxDiffIter)], lowEnvReg$fitt, col=lowCol, lwd=9)
+	lines(minQs[(5+maxDiffIter):nmbrOfBins], uppEnvReg$fitt, col=uppCol, lwd=9)
+	#abline(uppEnvReg$coef[[1]], uppEnvReg$coef[[2]])
+	#abline(lowEnvReg$coef[[1]], lowEnvReg$coef[[2]])
+	text(x=quantile(strmEx$lg_Q, .9), y=quantile(strmfl$lg_dQ, c(.05,.015)),
+		c(paste0("b=", round(uppEnvReg$coef[[2]], 3)),
+		paste0("b=", round(lowEnvReg$coef[[2]], 3))),
+		cex=1.5, col=c(uppCol, lowCol))
+	dev.off()
+
+	
+	#png(paste0(gage_number,"_PCR_Jul.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(strmEx$lg_Q, strmEx$lg_dQ, axes=FALSE, xlab="Q (cfs)", ylab="-dQ/dt (cfs)", main = gage_number,
+		col=pointCols, pch=pointPch)
+	axis(1, at=log(Qlabs), lab=Qlabs) 
+	axis(2, at=log(dQlabs), lab=dQlabs) 	
+	points(xmeds, ymeds, col=hlghtCols, lwd=1, pch=hlghtPch, , bg='grey95')
+	abline(julReg$coef[[1]], julReg$coef[[2]], col=julCol, lwd=9) 
+	text(x=quantile(strmEx$lg_Q, .9), y=quantile(strmfl$lg_dQ,.05),
+		paste0("b=", round(julReg$coef[[2]], 3)), cex=1.5, col=julCol)
+	dev.off()
+
+	
+
+	###################
+	#### event analysis
+	###################
+	# choosing colors and styles
+	library(RColorBrewer)
+	eventCols = rev(brewer.pal(n = 7, name = "Blues"))
+	eventPch = 21:24
+	outlineCol = 'grey10'
+		
+	# identifying specific recession events
+	recessPeriods = rle(strmEx$event)
+	recessValuesSrtd = recessPeriods$values[order(recessPeriods$lengths, decreasing=TRUE)] # sorting the recession periods by length of recession (days)
+	longRecess = head(recessValuesSrtd, 10)	#identifying the (x) longest periods of recession
+	shortRecess = tail(recessValuesSrtd, 5)	#identifying the (x) shortest periods of recession
+	bothRecess = c(longRecess, shortRecess)
+
+	thisEvent = list()
+	eventmod = list()	# for lm of an event
+	begineventmod = list()	# for lm of the first half of an event
+	endeventmod = list()	# for lm of the second half of an event
+	expeventmod = list()	# for exp mod of an event
+	logeventmod = list()	# for log mod of an event
+	sqdeventmod = list()	# for squared mod of an event
+	srteventmod = list()	# for square root mod of an event
+	endFirst = NULL
+	strtScnd = NULL
+	runLength = NULL
+
+	n = 1
+	for(m in bothRecess)	{
+		thisEvent[[n]] = strmEx[which(strmEx$event == m),]
+
+	eventmod[[n]] = lm(thisEvent[[n]]$lg_dQ ~ thisEvent[[n]]$lg_Q)
+
+		runLength[n] = length(thisEvent[[n]]$lg_Q) # to handle the issue that arises from finding the middle of odd v even length of runs
+		endFirst[n] = ifelse(runLength[n] %% 2 == 1,
+			ceiling(runLength[n] / 2),
+			runLength[n] / 2)
+		strtScnd[n] = ifelse(runLength[n] %% 2 == 1,
+			ceiling(runLength[n] / 2),
+			runLength[n] / 2 + 1)
+		begineventmod[[n]] = lm(thisEvent[[n]]$lg_dQ[1:endFirst[n]] ~ thisEvent[[n]]$lg_Q[1:endFirst[n]])
+		endeventmod[[n]] = lm(thisEvent[[n]]$lg_dQ[strtScnd[n]:runLength[n]] ~ thisEvent[[n]]$lg_Q[strtScnd[n]:runLength[n]])
+
+		expeventmod[[n]] = lm(exp(thisEvent[[n]]$lg_dQ) ~ thisEvent[[n]]$lg_Q)
+		modified_lg_Q = thisEvent[[n]]$lg_Q + 100
+		modified_lg_dQ = thisEvent[[n]]$lg_dQ + 100
+		logeventmod[[n]] = lm(log(modified_lg_dQ) ~ modified_lg_Q) # this is getting sloppy; trying to create a logarithmic model, but there are negative values, so I'm shifting the data into positive space by adding a large number
+
+		sqdeventmod[[n]] = lm((thisEvent[[n]]$lg_dQ)^2 ~ thisEvent[[n]]$lg_Q)
+		srteventmod[[n]] = lm((modified_lg_dQ)^.5 ~ modified_lg_Q)
+			
+		n = n + 1
+	}
+
+
+	# event plots
+	theEvents = c(1,2,9,5)
+				
+	# identifying 4 events
+	#png(paste0(gage_number,"_ER_4ex.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(strmEx$lg_Q, strmEx$lg_dQ, axes=FALSE, xlab="Q", ylab="dQ", main = gage_number, col=pointCols, pch=pointPch)
+	axis(1, at=log(Qlabs), labels=Qlabs) 
+	axis(2, at=log(dQlabs), labels=dQlabs) 
+	rangeX = range(strmEx$lg_Q)
+	rangeY = range(strmEx$lg_dQ)
+	incX = diff(rangeX) / 18
+	incY = diff(rangeY) / 18
+
+	m=0
+	for(n in theEvents)	{
+		m=m+1
+		points(thisEvent[[n]]$lg_Q, thisEvent[[n]]$lg_dQ, col=outlineCol, bg=eventCols[m],lwd=1, pch=eventPch[m], cex=1.7)
+	}
+	dev.off()
+
+	
+	#example hydrographs		
+	#png(paste0(gage_number,"_ER_4hydros.png"), width=1000, height=1000)
+	par(cex=3)
+	ymax=NULL
+	for(n in theEvents)	{
+	ymax=max(c(ymax, thisEvent[[n]]$Q))
+	}
+	xmax=max(recessPeriods$lengths)
+	plot(NULL,NULL, ylim=c(0,ymax), xlim=c(1,max(recessPeriods$lengths)),
+		axes=FALSE, xlab="Days", ylab="Q", main=gage_number)
+	axis(2, at=c(0,ymax), lab=c(0,ymax))
+	axis(1, at=c(1,xmax), lab=c(1,xmax))
+		
+	m=0
+	for(n in theEvents)	{
+	m=m+1
+	lines(thisEvent[[n]]$Q, type='b', bg=eventCols[m], col=outlineCol, lwd=1, pch=eventPch[m], cex=1.7)	# plotting the hydrobraphs
+	}
+	dev.off()
+	
+		
+	# linear models of the events which we've identified
+	#png(paste0(gage_number,"_ER_4LM.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(strmEx$lg_Q, strmEx$lg_dQ, axes=FALSE, xlab="Q", ylab="dQ", main = gage_number, col=pointCols, pch=pointPch)
+	axis(1, at=log(Qlabs), labels=Qlabs) 
+	axis(2, at=log(dQlabs), labels=dQlabs) 
+
+	m=0
+	for(n in theEvents)	{ # identifying the event Q and dQ values
+		m=m+1
+		points(thisEvent[[n]]$lg_Q, thisEvent[[n]]$lg_dQ, col=outlineCol, bg=eventCols[m],lwd=1, pch=eventPch[m], cex=2)
+	}
+	m=0
+	for(n in theEvents)	{	# plotting linear models on top of the events
+		m=m+1
+		lines(thisEvent[[n]]$lg_Q, eventmod[[n]]$fitt, col=outlineCol, lwd=6, lty=1)
+#		lines(thisEvent[[n]]$lg_Q, eventmod[[n]]$fitt, col=eventCols[m], lwd=3, lty=3)
+#		thisModel = lm(thisEvent[[n]]$lg_dQ ~ thisEvent[[n]]$lg_Q)
+#		abline(thisModel$coef[[1]], thisModel$coef[[2]], col=eventCols[m], lwd=4)
+#		abline(thisModel$coef[[1]], thisModel$coef[[2]], col=outlineCol, lwd=1.5)
+#		thisEvent$coef[[1]], julReg$coef[[2]], col=julCol, lwd=3) 
+		text(x=min(rangeX) + 7*incX, y=max(rangeY) - m*incY,
+			paste0("b=", round(eventmod[[n]]$coef[[2]], 3)), cex=1, pos=2, col=eventCols[m])
+	}
+	dev.off()
+	
+	#linear model residuals
+	#png(paste0(gage_number,"_ER_4LMres.png"), width=1000, height=1000)
+	par(cex=3)
+	resMax=NULL
+	for(n in theEvents)	{
+	resMax=max(c(resMax, abs(eventmod[[n]]$res)))
+	}
+	resMax=round(resMax, digits=2)
+	
+	isConcav = c(TRUE,FALSE,FALSE,FALSE)
+		
+	plot(NULL,NULL, ylim=c(-resMax,resMax), xlim=c(1,max(recessPeriods$lengths)),
+		axes=FALSE, xlab="Days", ylab="Residual", main=gage_number)
+	axis(2, at=c(-resMax,0,resMax), lab=c(-resMax,0,resMax))
+	axis(1, at=c(1,xmax), lab=c(1,xmax))
+	abline(h=0,lwd=5,col='grey85')
+	m=0
+	for(n in theEvents)	{
+		m=m+1
+		lines(eventmod[[n]]$res,  col=eventCols[m], type='b',lwd=2)	# plotting the residuals
+		points(eventmod[[n]]$res, pch=eventPch[m], bg=eventCols[m], cex=2,
+			col=ifelse(isConcav[m], outlineCol, "red2"), lwd=2.8)
+	}
+	dev.off()
+
+	
+	#early v late recession
+	#png(paste0(gage_number,"_ER_4earlat.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(strmEx$lg_Q, strmEx$lg_dQ, axes=FALSE, xlab="Q", ylab="dQ", main = gage_number, col=pointCols, pch=pointPch)
+	axis(1, at=log(Qlabs), labels=Qlabs) 
+	axis(2, at=log(dQlabs), labels=dQlabs) 
+	isConcav = c(TRUE,FALSE,FALSE,FALSE)
+
+	m=0
+	for(n in theEvents)	{ # identifying the event Q and dQ values
+		m=m+1
+		points(thisEvent[[n]]$lg_Q, thisEvent[[n]]$lg_dQ, col=outlineCol, bg=eventCols[m],lwd=1, pch=eventPch[m], cex=2)
+	}
+
+	m=0
+	for(n in theEvents)	{
+		m=m+1
+		startQ = first(thisEvent[[n]]$lg_Q)
+		midQ = median(thisEvent[[n]]$lg_Q)
+		endQ = last(thisEvent[[n]]$lg_Q)
+		begineventmod[[n]]$fitt
+		endeventmod[[n]]$fitt
+		lines(x=c(startQ,midQ), y=c(begineventmod[[n]]$fitt[1],last(begineventmod[[n]]$fitt)), type='b', lwd=4,
+			col=ifelse(isConcav[m], outlineCol, "red2"), pch=20)
+		lines(x=c(midQ,endQ), y=c(endeventmod[[n]]$fitt[1],last(endeventmod[[n]]$fitt)), type='b', lwd=4,
+			col=ifelse(isConcav[m], outlineCol, "red2"), pch=20)
+			
+		text(x=min(rangeX) + 7*incX, y=max(rangeY) - m*incY,
+			paste0("b=", round(begineventmod[[n]]$coef[[2]], 2), " to ",round(endeventmod[[n]]$coef[[2]], 2)),
+			cex=1, pos=2, col=eventCols[m])
+	}
+	dev.off()
+	
+			
+	#log v exp model
+	#png(paste0(gage_number,"_ER_4explog.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(strmEx$lg_Q, strmEx$lg_dQ, axes=FALSE, xlab="Q", ylab="dQ", main = gage_number, col=pointCols, pch=pointPch)
+	axis(1, at=log(Qlabs), labels=Qlabs) 
+	axis(2, at=log(dQlabs), labels=dQlabs) 
+	curvyCols = c("yellow2", "yellow4")
+	isConcav = c(TRUE,FALSE,FALSE,FALSE)
+		
+	m=0
+	for(n in theEvents)	{ # identifying the event Q and dQ values
+		m=m+1
+		points(thisEvent[[n]]$lg_Q, thisEvent[[n]]$lg_dQ, col=outlineCol,
+			bg=eventCols[m],lwd=1, pch=eventPch[m], cex=2)
+	}
+
+	m=0
+	for(n in theEvents)	{
+		m=m+1
+		lines(thisEvent[[n]]$lg_Q, log(expeventmod[[n]]$fitt), type='l', lwd=4, lty=1,
+			col=ifelse(isConcav[m], outlineCol, "red2"))
+#		lines(thisEvent[[n]]$lg_Q, log(expeventmod[[n]]$fitt),
+#			col=eventCols[m], type='l', lwd=1.5)
+		lines(thisEvent[[n]]$lg_Q, exp(logeventmod[[n]]$fitt) - 100, type='l', lwd=5, lty=3,
+			col=ifelse(isConcav[m], outlineCol, "red2"))
+#		lines(thisEvent[[n]]$lg_Q, exp(logeventmod[[n]]$fitt) - 100,
+#			col=eventCols[m], type='l', lwd=1.5)
+			
+		text(x=min(rangeX) + 11*incX, y=max(rangeY) - m*incY,
+			paste0("exp r2=", round(summary(expeventmod[[n]])$adj, 2), ", log r2=",
+				round(summary(logeventmod[[n]])$adj, 2)),
+			cex=1, pos=2, col=eventCols[m])
+	}
+	dev.off()
+	
+		
+	#sqrt v sqd model
+	#png(paste0(gage_number,"_ER_4sqdsqrt.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(strmEx$lg_Q, strmEx$lg_dQ, axes=FALSE, xlab="Q", ylab="dQ", main = gage_number, col=pointCols, pch=pointPch)
+	axis(1, at=log(Qlabs), labels=Qlabs) 
+	axis(2, at=log(dQlabs), labels=dQlabs) 
+	curvyCols = c("yellow2", "yellow4")
+	isConcav = c(TRUE,FALSE,FALSE,TRUE)
+		
+	m=0
+	for(n in theEvents)	{ # identifying the event Q and dQ values
+		m=m+1
+		points(thisEvent[[n]]$lg_Q, thisEvent[[n]]$lg_dQ, col=outlineCol,
+			bg=eventCols[m],lwd=1, pch=eventPch[m], cex=2)
+	}
+
+	m=0
+	for(n in theEvents)	{
+		m=m+1
+		lines(thisEvent[[n]]$lg_Q, sqdeventmod[[n]]$fitt^.5, type='l', lwd=4, lty=1,
+			col=ifelse(isConcav[m], outlineCol, "red2"))
+#		lines(thisEvent[[n]]$lg_Q, log(expeventmod[[n]]$fitt),
+#			col=eventCols[m], type='l', lwd=1.5)
+		lines(thisEvent[[n]]$lg_Q, srteventmod[[n]]$fitt^2 - 100, type='l', lwd=5, lty=3,
+			col=ifelse(isConcav[m], outlineCol, "red2"))
+#		lines(thisEvent[[n]]$lg_Q, exp(logeventmod[[n]]$fitt) - 100,
+#			col=eventCols[m], type='l', lwd=1.5)
+			
+		text(x=min(rangeX) + 12*incX, y=max(rangeY) - m*incY,
+			paste0("x^2 r2=", round(summary(sqdeventmod[[n]])$adj, 2), ", x^(1/2) r2=",
+				round(summary(srteventmod[[n]])$adj, 2)),
+			cex=1, pos=2, col=eventCols[m])
+	}	
+	dev.off()
+	
+	
+	#circle model
+	#png(paste0(gage_number,"_ER_4circles.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(strmEx$lg_Q, strmEx$lg_dQ, axes=FALSE, xlab="Q", ylab="dQ", main = gage_number, col=pointCols, pch=pointPch)
+	axis(1, at=log(Qlabs), labels=Qlabs) 
+	axis(2, at=log(dQlabs), labels=dQlabs) 
+	curvyCols = c("yellow2", "yellow4")
+	isConcav = c(TRUE,FALSE,FALSE,FALSE)
+		
+	m=0
+	for(n in theEvents)	{ # identifying the event Q and dQ values
+		m=m+1
+		points(thisEvent[[n]]$lg_Q, thisEvent[[n]]$lg_dQ, col=outlineCol,
+			bg=eventCols[m],lwd=1, pch=eventPch[m], cex=2)
+	}
+		
+	xyr = NULL
+	m=0
+	for(n in theEvents)	{
+		m=m+1
+		oneEvent = thisEvent[[n]]
+		theFit = CircleFitByKasa(cbind(oneEvent$lg_Q, oneEvent$lg_dQ))
+		xyr = rbind(xyr, theFit[,1:3])
+		lines(calculateCircle(xyr[m,1], xyr[m,2], xyr[m,3]), type='l', lwd=4,
+			col=ifelse(isConcav[m], outlineCol, "red2"))
+	}
+
+	
+	
+############################################################################
+####	Part III
+####	Analysis of All Watersheds
+############################################################################	
+setwd("~")	;	rchar = read.csv("recessionOutput_primaryAnalysis_WRR2019.csv")
+rchar = recess_char		# changing the file name, so the file isn't accidentally written over
+	
+	
+#	regression of b values from all methods from all watersheds
+r2Col = "grey5"
+slpCol = "blue3"
+lmCol = "grey5"
+oneCol = 'red3'
+	
+#png(paste0("b_values_regression.png"), width = 3840, height = 3840)
+par(mfrow=c(6,6), mar=c(0,0,0,0), oma=c(4,4,1,1), cex=5)
+		
+	#####	row 1
+	#title of point cloud regression
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	text(x=.15, y=.5, labels="Rpc", col=pcCol, pos=4, cex=3)
+
+	# slope and r2 of Rk to Rpc
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RpcRk = lm(rchar$kirch ~ rchar$all)
+	text(x=.5, y=.65, labels=paste(round(summary(RpcRk)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RpcRk$coef[2], 2)), cex=2, col=slpCol)
+			
+	# slope and r2 of Ru to Rpc
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RpcRu = lm(rchar$upp ~ rchar$all)
+	text(x=.5, y=.65, labels=paste(round(summary(RpcRu)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RpcRu$coef[2], 2)), cex=2, col=slpCol)
+
+	# slope and r2 of Rl to Rpc
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RpcRl = lm(rchar$low ~ rchar$all)
+	text(x=.5, y=.65, labels=paste(round(summary(RpcRl)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RpcRl$coef[2], 2)), cex=2, col=slpCol)
+
+	# slope and r2 of Rjul to Rpc
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RpcRjul = lm(rchar$dly ~ rchar$all)
+	text(x=.5, y=.65, labels=paste(round(summary(RpcRjul)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RpcRjul$coef[2], 2)), cex=2, col=slpCol)
+
+	# slope and r2 of Re-med to Rpc
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RpcRemed = lm(rchar$event ~ rchar$all)
+	text(x=.5, y=.65, labels=paste(round(summary(RpcRemed)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RpcRemed$coef[2], 2)), cex=2, col=slpCol)
+
+		
+	#####	row 2
+	# recession plot for Rk to Rpc
+	plot(rchar$all, rchar$kirch, col=pointCols, pch=pointPch,  xaxt='n')#axes=FALSE)
+	abline(reg=RpcRk, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+		
+	#title of kirchner regression
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	text(x=.2, y=.5, labels="Rk", col=kCol, pos=4, cex=3)
+
+	# slope and r2 of Ru to Rk
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RuRk = lm(rchar$upp ~ rchar$kirch)
+	text(x=.5, y=.65, labels=paste(round(summary(RuRk)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RuRk$coef[2], 2)), cex=2, col=slpCol)
+
+	# slope and r2 of Rl to Rk
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RlRk = lm(rchar$low ~ rchar$kirch)
+	text(x=.5, y=.65, labels=paste(round(summary(RlRk)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RlRk$coef[2], 2)), cex=2, col=slpCol)# slope and r2 of Re-med to Rpc
+
+	# slope and r2 of Rjul to Rk
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RjulRk = lm(rchar$dly ~ rchar$kirch)
+	text(x=.5, y=.65, labels=paste(round(summary(RjulRk)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RjulRk$coef[2], 2)), cex=2, col=slpCol)# slope and r2 of Re-med to Rpc
+
+	# slope and r2 of Remed to Rk
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RemedRk = lm(rchar$event ~ rchar$kirch)
+	text(x=.5, y=.65, labels=paste(round(summary(RemedRk)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RemedRk$coef[2], 2)), cex=2, col=slpCol)
+			
+		
+	#####	row 3
+	# recession plot for Ru to Rpc
+	plot(rchar$all, rchar$upp, col=pointCols, pch=pointPch,  xaxt='n')#axes=FALSE)
+	abline(reg=RpcRu, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	# recession plot for Ru to Rk
+	plot(rchar$kirch, rchar$upp, col=pointCols, pch=pointPch,  xaxt='n', yaxt='n')#axes=FALSE)
+	abline(reg=RuRk, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	#title of upper envelope regression
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	text(x=.15, y=.5, labels="Ru", col=uppCol, pos=4, cex=3)
+
+	# slope and r2 of Rl to Ru
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RuRl = lm(rchar$low ~ rchar$upp)
+	text(x=.5, y=.65, labels=paste(round(summary(RuRl)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RuRl$coef[2], 2)), cex=2, col=slpCol)# slope and r2 of Re-med to Rpc
+
+	# slope and r2 of Rjul to Ru
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RjulRu = lm(rchar$dly ~ rchar$upp)
+	text(x=.5, y=.65, labels=paste(round(summary(RjulRu)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RjulRu$coef[2], 2)), cex=2, col=slpCol)# slope and r2 of Re-med to Rpc
+
+	# slope and r2 of Remed to Ru
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RemedRu = lm(rchar$event ~ rchar$upp)
+	text(x=.5, y=.65, labels=paste(round(summary(RemedRu)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RemedRu$coef[2], 2)), cex=2, col=slpCol)
+		
+		
+	#####	row 4
+	# recession plot for Rl to Rpc
+	plot(rchar$all, rchar$low, col=pointCols, pch=pointPch,  xaxt='n')#axes=FALSE)
+	abline(reg=RpcRl, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	# recession plot for Rl to Rk
+	plot(rchar$kirch, rchar$low, col=pointCols, pch=pointPch,  xaxt='n', yaxt='n')#axes=FALSE)
+	abline(reg=RlRk, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	# recession plot for Rl to Ru
+	plot(rchar$upp, rchar$low, col=pointCols, pch=pointPch,  xaxt='n', yaxt='n')#axes=FALSE)
+	abline(reg=RuRl, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	#title of lower envelope regression
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	text(x=.2, y=.5, labels="Rl", col=lowCol, pos=4, cex=3)
+
+	# slope and r2 of Rjul to Rl
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RjulRl = lm(rchar$dly ~ rchar$low)
+	text(x=.5, y=.65, labels=paste(round(summary(RjulRl)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RjulRl$coef[2], 2)), cex=2, col=slpCol)# slope and r2 of Re-med to Rpc
+
+	# slope and r2 of Remed to Rl
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RemedRl = lm(rchar$event ~ rchar$low)
+	text(x=.5, y=.65, labels=paste(round(summary(RemedRl)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RemedRl$coef[2], 2)), cex=2, col=slpCol)
+
+
+	#####	row 5
+	# recession plot for Rjul to Rpc
+	plot(rchar$all, rchar$dly, col=pointCols, pch=pointPch,  xaxt='n')#axes=FALSE)
+	abline(reg=RpcRjul, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	# recession plot for Rjul to Rk
+	plot(rchar$kirch, rchar$dly, col=pointCols, pch=pointPch,  xaxt='n', yaxt='n')#axes=FALSE)
+	abline(reg=RjulRk, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	# recession plot for Rjul to Ru
+	plot(rchar$upp, rchar$dly, col=pointCols, pch=pointPch,  xaxt='n', yaxt='n')#axes=FALSE)
+	abline(reg=RjulRu, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	# recession plot for Rjul to Rl
+	plot(rchar$low, rchar$dly, col=pointCols, pch=pointPch,  xaxt='n', yaxt='n')#axes=FALSE)
+	abline(reg=RjulRl, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	#title of daily avg (jul) regression
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	text(x=.075, y=.5, labels="Rday", col=julCol, pos=4, cex=3)
+
+	# slope and r2 of Remed to Rjul
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	RemedRjul = lm(rchar$event ~ rchar$dly)
+	text(x=.5, y=.65, labels=paste(round(summary(RemedRjul)$adj.r, 2)), cex=2.5, col=r2Col)
+	text(x=.5, y=.35, labels=paste(round(RemedRjul$coef[2], 2)), cex=2, col=slpCol)
+
+		
+	#####	row 6
+	# recession plot for Remed to Rpc
+	plot(rchar$all, rchar$event, col=pointCols, pch=pointPch)#axes=FALSE)
+	abline(reg=RpcRemed, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	# recession plot for Remed to Rk
+	plot(rchar$kirch, rchar$event, col=pointCols, pch=pointPch, yaxt='n')#axes=FALSE)
+	abline(reg=RemedRk, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	# recession plot for Remed to Ru
+	plot(rchar$upp, rchar$event, col=pointCols, pch=pointPch, yaxt='n')#axes=FALSE)
+	abline(reg=RemedRu, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	# recession plot for Remed to Rl
+	plot(rchar$low, rchar$event, col=pointCols, pch=pointPch, yaxt='n')#axes=FALSE)
+	abline(reg=RemedRjul, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	# recession plot for Remed to Rjul
+	plot(rchar$dly, rchar$event, col=pointCols, pch=pointPch, yaxt='n')#axes=FALSE)
+	abline(reg=RemedRjul, col=lmCol, lwd=12)
+	abline(0,1, col=oneCol, lty=3, lwd=12)
+
+	#title of median event regression
+	plot(0:1,0:1, col=NULL,  ylab = "", xaxt='n', yaxt='n')#axes=FALSE)
+	text(x=0, y=.5, labels="Rmed", col=eventCols, pos=4, cex=3)
+	
+	dev.off()
+		
+	
+#	typical values of b (boxplots)
+par(mfrow=c(1,1), mar=c(2,2,1,1))
+loopedcols =c(pcCol, kCol, uppCol, lowCol, julCol, eventCols)
+
+nmstoplot=c('allmod_slope', 'kirch_slope', 'uppmod_slope', 'lowmod_slope', 'dly_med_slope', 'event_med_slope')
+yrang = range(rchar[,paste(nmstoplot)], na.rm=TRUE)
+yintgrs = seq(ceiling(yrang[1]), floor(yrang[2]), 1)
+xrang = c(0,length(nmstoplot)+1)	
+
+
+	#png(paste0("b_values_boxplot.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(x=NULL,y=NULL, col=NULL, ylab="b", xlab="", xaxt='n', yaxt='n',
+		ylim=yrang, xlim=xrang+c(.5,-.5), cex=2)#axes=FALSE)
+	axis(1, at=1:length(nmstoplot), labels=c("Rpc", "Rk", "Ru", "Rl", "Rjul", "Rmed"))
+	axis(2, at=yintgrs)
+
+	abline(h=yintgrs, col='grey90')
+
+	for(i in 1:length(nmstoplot))	{
+		points(x=rep(i,12), y=c(head(sort(rchar[,nmstoplot[i]]), 6), tail(sort(rchar[,nmstoplot[i]]), 6)),
+			pch="*", col="grey50")
+
+	#	points(x=c(i,i), y=c(min(rchar[,nmstoplot[i]], na.rm=TRUE), max(rchar[,nmstoplot[i]], na.rm=TRUE)),
+	#		pch='x', col="grey50")
+		lines(x=c(i,i), y=quantile(rchar[,nmstoplot[i]], probs=c(.005,.995), na.rm=TRUE),
+			lwd=2, col="grey50")
+		lines(x=c(i,i), y=quantile(rchar[,nmstoplot[i]], probs=c(.05,.95), na.rm=TRUE),
+			lwd=4, col="grey50")
+		rect(i-.4, quantile(rchar[,nmstoplot[i]], probs=.25, na.rm=TRUE),
+			i+.4, quantile(rchar[,nmstoplot[i]], probs=.75, na.rm=TRUE),
+			col=loopedcols[i])
+		lines(c(i-.4, i+.4), rep(median(rchar[,nmstoplot[i]], na.rm=TRUE),2), lwd=5, col='grey10')
+		}
+
+
+#	typical frequencies of concavity (boxplots)
+rchar$concav_frac_multi = rchar$tot_concav / rchar$tot_events
+nmstoplot=c('convex_frac_esum', 'convex_frac_slpvslp', 'convex_frac_pwrlg', 'convex_frac_sqdvsrt', 'convex_frac_circ', 'concav_frac_multi')
+yrang = c(0,1)
+xrang = c(0,length(nmstoplot)+1)	
+
+
+	#png(paste0("frac_concavity_boxplot.png"), width=1000, height=1000)
+	par(cex=3)
+	plot(x=NULL,y=NULL, col=NULL, ylab="Fraction of Concave Events per Watershed (-)", xlab="", xaxt='n', yaxt='n',
+		ylim=yrang, xlim=xrang+c(.5,-.5), cex=2)#axes=FALSE)
+	axis(1, at=1:length(nmstoplot), labels=c("Cres", 'Cslp', 'Cpwr', 'Csqd', 'Ccrc', 'Cmlt'))
+	axis(2, at=seq(0,1,.2))
+
+	abline(h=seq(.2,.8,.2), col='grey90')
+
+	for(i in 1:(length(nmstoplot)-1))	{
+		points(x=rep(i,12), y=1-c(head(sort(rchar[,nmstoplot[i]]), 6), tail(sort(rchar[,nmstoplot[i]]), 6)),
+			pch="*", col="grey50")
+
+	#	points(x=c(i,i), y=c(min(rchar[,nmstoplot[i]], na.rm=TRUE), max(rchar[,nmstoplot[i]], na.rm=TRUE)),
+	#		pch='x', col="grey50")
+		lines(x=c(i,i), y=1-quantile(rchar[,nmstoplot[i]], probs=c(.005,.995), na.rm=TRUE),
+			lwd=2, col="grey50")
+		lines(x=c(i,i), y=1-quantile(rchar[,nmstoplot[i]], probs=c(.05,.95), na.rm=TRUE),
+			lwd=4, col="grey50")
+		rect(i-.4, 1-quantile(rchar[,nmstoplot[i]], probs=.25, na.rm=TRUE),
+			i+.4, 1-quantile(rchar[,nmstoplot[i]], probs=.75, na.rm=TRUE),
+			col='orangered4')#'coral2')
+		lines(c(i-.4, i+.4), 1-rep(median(rchar[,nmstoplot[i]], na.rm=TRUE),2), lwd=5, col='grey10')
+		}
+		
+		# because the original calculations were for convexity, the last iteration of graphs has to be run indpendently to account for 1-x
+		i=i+1
+		points(x=rep(i,12), y=c(head(sort(rchar[,nmstoplot[i]]), 6), tail(sort(rchar[,nmstoplot[i]]), 6)),
+			pch="*", col="grey50")
+
+	#	points(x=c(i,i), y=c(min(rchar[,nmstoplot[i]], na.rm=TRUE), max(rchar[,nmstoplot[i]], na.rm=TRUE)),
+	#		pch='x', col="grey50")
+		lines(x=c(i,i), y=quantile(rchar[,nmstoplot[i]], probs=c(.005,.995), na.rm=TRUE),
+			lwd=2, col="grey50")
+		lines(x=c(i,i), y=quantile(rchar[,nmstoplot[i]], probs=c(.05,.95), na.rm=TRUE),
+			lwd=4, col="grey50")
+		rect(i-.4, quantile(rchar[,nmstoplot[i]], probs=.25, na.rm=TRUE),
+			i+.4, quantile(rchar[,nmstoplot[i]], probs=.75, na.rm=TRUE),
+			col='orangered1')
+		lines(c(i-.4, i+.4), rep(median(rchar[,nmstoplot[i]], na.rm=TRUE),2), lwd=5, col='grey10')
+
+		
+		
+#	A table of predicitons of concavity (convexity) using b values from each method, i.e. Table 1
+
+bvalnms = names(rchar)[c(4,7,5,6,8,9)]
+convexies = rchar$tot_convex / rchar$tot_events
+concavies = rchar$tot_concav / rchar$tot_events
+indetrmies = (rchar$tot_events - rchar$tot_convex + rchar$tot_concav) / rchar$tot_events
+
+	r2s = NULL	;	slps = NULL
+	for(i in 1:6)	{
+		thismod = summary(lm(concavies ~ rchar[,bvalnms[i]]))
+		r2s = c(r2s, thismod$adj)
+		slps = c(slps, thismod$coef[2])
+	}
+	allvals = rbind(r2s, slps)
+	r2s = NULL	; slps = NULL
+	for(i in 1:6)	{
+		thismod = summary(lm(indetrmies ~ rchar[,bvalnms[i]]))
+		r2s = c(r2s, thismod$adj)
+		slps = c(slps, thismod$coef[2])
+	}
+	allvals = rbind(allvals, r2s, slps)
+	r2s = NULL	; slps = NULL
+	for(i in 1:6)	{
+		thismod = summary(lm(convexies ~ rchar[,bvalnms[i]]))
+		r2s = c(r2s, thismod$adj)
+		slps = c(slps, thismod$coef[2])
+	}
+	allvals = rbind(allvals, r2s, slps)
+	colnames(allvals) = c("Rpc", "Rk", "Ru", "Rl", "Rjul", "Rmed")
+	#write.csv(allvals, "slopes_predicting_nonlinearity.csv")		# writing the data for table 1
+
+
+
+#	typical frequencies of the 9 categories of steepness / concavity
+
+rchar$concav_frac_multi = rchar$tot_concav / rchar$tot_events # or / 10 in long10
+nmstoplot=c('fltcav', 'fltnth', 'fltvex', 'okycav', 'okynth', 'okyvex', 'stpcav', 'stpnth', 'stpvex')
+yrang = c(0,1)
+xrang = c(0,length(nmstoplot)+1)   
+
+    #png(paste0("frac_steepNcon_boxplot.png"), width=600)
+    plot(x=NULL,y=NULL, col=NULL, ylab="Fraction of Events per Watershed (-)", xlab="", xaxt='n', yaxt='n',
+        ylim=yrang, xlim=xrang+c(.5,-.5), cex=2, bty='n')#axes=FALSE)
+    axis(1, at=1:length(nmstoplot), labels=c('F-cav', 'F-ind', 'F-vex', 'E-cav', 'E-ind', 'E-vex', 'S-cav', 'S-ind', 'S-vex'))
+    axis(2, at=seq(0,1,.2))
+
+	rect(-1, 1, 3.5, 0, col='grey95', border=NA)
+	rect(3.5, 1, 6.5, 0, col='grey85', border=NA)
+	rect(6.5, 1, 10, 0, col='grey75', border=NA)
+	
+	curv_cols = rep(c('yellow2', 'olivedrab2', 'lightblue2'),3) 
+    abline(h=seq(0,1,.2), col='grey10')
+    abline(h=seq(.1,.9,.2), col='grey50', lty=3)
+
+    for(i in 1:(length(nmstoplot)))    {
+        points(x=rep(i,12), y=c(head(sort(rchar[,nmstoplot[i]]), 6), tail(sort(rchar[,nmstoplot[i]]), 6)),
+            pch="*", col="grey10")
+
+    #    points(x=c(i,i), y=c(min(rchar[,nmstoplot[i]], na.rm=TRUE), max(rchar[,nmstoplot[i]], na.rm=TRUE)),
+    #        pch='x', col="grey50")
+        lines(x=c(i,i), y=quantile(rchar[,nmstoplot[i]], probs=c(.005,.995), na.rm=TRUE),
+            lwd=2, col="grey10")
+        lines(x=c(i,i), y=quantile(rchar[,nmstoplot[i]], probs=c(.05,.95), na.rm=TRUE),
+            lwd=4, col="grey10")
+        rect(i-.4, quantile(rchar[,nmstoplot[i]], probs=.25, na.rm=TRUE),
+            i+.4, quantile(rchar[,nmstoplot[i]], probs=.75, na.rm=TRUE),
+            col=curv_cols[i])
+        lines(c(i-.4, i+.4), rep(median(rchar[,nmstoplot[i]], na.rm=TRUE),2), lwd=5, col='grey10')
+        }
+       
+#	sum of categories which might (or certainly don't) match boussinesq predictions
+rchar$isboussin = apply(rchar[, c("okycav", "okynth", "stpcav")], 1, sum, na.rm=FALSE)
+rchar$maybeboussin = apply(rchar[, c("fltcav", "fltnth", "okycav", "okynth", "stpcav")], 1, sum, na.rm=FALSE)
+rchar$isntboussin = apply(rchar[, c("fltvex", "okyvex", "stpnth", "stpvex")],1, sum, na.rm=FALSE)
+
+
+#	assessing hydrographs of streamfs which are more likely concave than convex
+concavruns = which(rchar$tot_concav > rchar$tot_convex)
+
+	#png(paste0("concav_hydrographs.png"), width=1440, height=860)
+	par(mfrow=c(3,3), mar=c(3,3,0,0), oma=c(1,4,1,1), cex=1.8)
+
+	iter = 0
+	for(g in concavruns)	{
+	run = g
+	gage_number = all_gages[ref_gages[run], "STAID"]
+		recess_char[run, "gage"] = gage_number
+		recess_char[run, "region"] = all_gages[ref_gages[run] , "AGGECOREGION"]
+	   
+	   
+		USGS_webpage = paste0("https://waterdata.usgs.gov/nwis/dv?cb_00060=on&format=rdb&site_no=",
+			gage_number, "&referred_module=sw&period=&begin_date=",
+			start_date, "&end_date=", end_date)
+	   
+			# read in the initial ### lines from the webpage, then find the line where the comment characters actually end
+				# the problem is that there are two lines of header on the webpage following a somewhat random number of lines of comment characters, while the number and order of columns is also indeterminite
+		max_lines_to_read = 100         # 50 lines is probably safe, but whatever
+		gage_header_data = scan(USGS_webpage, what = character(), nmax = max_lines_to_read, sep = "\n")
+		if (NROW(gage_header_data) == 100)  {
+			init_char = "#"                 # looking for the first line that doesnt start with "#"... prob not efficient
+			increment = 0                   # ultimately tells where fread should start reading in data (+2)
+			while (init_char == "#")    {
+				increment = increment + 1
+				init_char = substr(gage_header_data[increment], 1, 1)
+				}
+		   
+			col_names = strsplit(gage_header_data[increment], "\t")        # saving the column names for later
+			q_col_num = which(substrRight(col_names[[1]], 11) == "00060_00003")[1] # identifying q using the final 11 chars of the column name
+				#sometimes streamflow (00060_00003) is given in multiple units (e.g., cfs and cms) or by multiple gages, so later we identify which has the longest period of record and use that one
+				# !!!!! the code currently just uses the first instance.... need to change in future
+			if(!is.na(q_col_num))   {
+			   
+					# use fread to skip the first XX lines and headers to read in the actual data
+				gage_data = fread(USGS_webpage, header = FALSE, skip = increment + 1, na.strings=c("NA", "Ssn", "Ice", "Eqp", "Bkw", "Dry", "Zfl", "Pr", "Rat", "Fld", "Dis", "--", "Mnt", "***")) # na.strings should change all strings I've listed to NA value, which is fine since we simply won't use that time period
+				colnames(gage_data) = col_names[[1]]
+			   
+			   
+					# creating a new data frame using only streamflow, change in streamflow, and dates
+				streamy = cbind.data.frame(as.Date(gage_data$datetime), gage_data[, q_col_num, with = FALSE])
+				colnames(streamy) = c("Date", "origQ")
+			}
+		}
+		laststart = tail(which(yday(streamy$Date) == 1), 2)[1]	# identifying the first day of the final full year on record
+		lastyear = laststart:(laststart+365)
+		
+		iter = iter+1
+		if(iter %% 3 == 1)	{plot(streamy[lastyear,], type='l', col='blue', ylab="Q (cfs)", xlab="", lwd=3)}
+		else	{plot(streamy[lastyear,], type='l', col='blue', ylab="", xlab="", lwd=3)}
+					
+	}	
+		
+		
+
+		
+		
+		
+		
+
+
+############################################################################
+####	Part IV
+####	Making Maps
+############################################################################	
+		#######################################################################
+		# new methods with sf
+		#######################################################################
+library("ggplot2")
+library("sf")
+library("rnaturalearth")	# for base map
+library("rnaturalearthdata")	# for downlading lakes and rivers data
+library("ggspatial")		# for scale bar
+
+
+###########################################################################	
+setwd("~")	;	#rchar = read.csv("recessionOutput_primaryAnalysis_WRR2019.csv")
+rchar = recess_char		# changing the file name, so the file isn't accidentally written over
+	
+
+ all_gages = read.csv("conterm_bas_classif.txt", colClasses = c("STAID" = "character", "AGGECOREGION" = "character")) #   read in the GAGES-II data
+ ref_gages = which(all_gages$CLASS == "Ref")     #   identify which basins are chategorized as reference basins
+ rchar$gage = all_gages$STAID[ref_gages]
+
+
+	# Individual files to be read in from the GAGES-II database
+#setwd("~\\Documents\\PhD Research\\D2\\spreadsheets-in-csv-format")
+basinid = read.csv("conterm_basinid.txt", colClasses = c("STAID" = "character"))
+soils = read.csv("conterm_soils.txt", colClasses = c("STAID" = 'character'))
+hydro = read.csv('conterm_hydro.txt', colClasses = c('STAID' = 'character'))
+topo = read.csv('conterm_topo.txt', colClasses = c('STAID' = 'character'))
+morph = read.csv('conterm_bas_morph.txt', colClasses = c('STAID' = 'character'))
+clim = read.csv('conterm_climate.txt', colClasses = c('STAID' = 'character'))
+
+basin_chars = merge(rchar, basinid, by.x='gage', by.y='STAID')
+basin_chars = merge(basin_chars, soils, by.x='gage', by.y='STAID')
+basin_chars = merge(basin_chars, hydro, by.x='gage', by.y='STAID')
+basin_chars = merge(basin_chars, topo, by.x='gage', by.y='STAID')
+basin_chars = merge(basin_chars, morph, by.x='gage', by.y='STAID')
+basin_chars = merge(basin_chars, clim, by.x='gage', by.y='STAID')
+
+
+
+
+#basin_chars$long = basin_chars$LNG_GAGE
+#basin_chars$lat = basin_chars$LAT_GAGE
+basin_chars$long = basin_chars$LONG_CENT
+basin_chars$lat = basin_chars$LAT_CENT
+bchars_sf = st_as_sf(subset(basin_chars, tot_events>49), coords = c("LNG_GAGE", "LAT_GAGE"),							# convert foreign object to object class sf
+	crs = st_crs(4326))
+	#"+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=37.5 +lon_0=-96 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs")	
+
+lakes <- ne_download(scale = "medium", type = 'lakes', category = 'physical', returnclass="sf")
+rivers <- ne_download(scale = "medium", type = 'rivers_lake_centerlines', category = 'physical', returnclass='sf')
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+
+	
+#	re-declaring colors for consistency:
+pcCol = "darkgreen"#theCols[1]
+kCol = "darkorchid4"#theCols[40]
+uppCol = "orangered3"#theCols[70]
+lowCol = "orangered4"#theCols[90]
+julCol = "chocolate4"
+slpCol = "blue4"
+		
+###		For creating the maps of recession slope b values
+#	Rpc
+	ggplot(data = world) +
+		geom_sf(fill='grey95', color="grey95", ) +
+		geom_sf(data=rivers, color='white') 	+
+		geom_sf(data=lakes, fill='white', color='grey95') +
+		geom_sf(data = bchars_sf, shape=16, size=2, alpha=0.7, aes(color=allmod_slope))+#,  stroke=event_sd_slope^.5*1.2))	+
+		scale_color_viridis_c(name="Rpc", end=0.9, na.value="grey95", limits=c(0,7), direction=-1)	+
+#		scale_colour_gradient2(name="Rpc", low = "khaki1", high = slpCol, mid='#EE82EE', midpoint=3.5, na.value="grey95", limits=c(0,7))	+
+		coord_sf(crs = st_crs(2163), xlim = c(2580000, -2100000), ylim = c(-2200000, 920000),expand=FALSE)	+
+		#annotation_scale(location = "bl", width_hint = 0.5) +
+		#annotation_north_arrow(location = "bl", which_north = "true", 
+		#	pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+		#	style = north_arrow_fancy_orienteering) +
+		theme(legend.position = c(0.07, 0.22),
+			panel.background=element_rect(fill='white', color='grey95'),
+			panel.grid.major=element_line(color='grey95'),
+			panel.grid.minor=element_line(color='grey95'),
+			legend.background = element_blank(),
+			legend.title = element_text(size=12, color = "grey15", face="bold"))	
+		ggsave("b_distribution_PC.png", width = 6, height = 4, dpi = 800)
+
+
+#	Rk
+	ggplot(data = world) +
+		geom_sf(fill='grey95', color="grey95", ) +
+		geom_sf(data=rivers, color='white') 	+
+		geom_sf(data=lakes, fill='white', color='grey95') +
+		geom_sf(data = bchars_sf, shape=16, size=2, alpha=0.7, aes(color=kirch_slope))+#,  stroke=event_sd_slope^.5*1.2))	+
+		scale_color_viridis_c(name="Rk",  end=0.9,na.value="grey95", limits=c(0,7), direction=-1)	+
+#		scale_colour_gradient2(name="Rk",low = "khaki1", high = slpCol, mid='#EE82EE', midpoint=3.5, na.value="grey95", limits=c(0,7))	+
+		coord_sf(crs = st_crs(2163), xlim = c(2580000, -2100000), ylim = c(-2200000, 920000),expand=FALSE)	+
+		#annotation_scale(location = "bl", width_hint = 0.5) +
+		#annotation_north_arrow(location = "bl", which_north = "true", 
+		#	pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+		#	style = north_arrow_fancy_orienteering) +
+		theme(legend.position = c(0.07, 0.22),
+			panel.background=element_rect(fill='white', color='grey95'),
+			panel.grid.major=element_line(color='grey95'),
+			panel.grid.minor=element_line(color='grey95'),
+			legend.background = element_blank(),
+			legend.title = element_text(size=12, color = "grey15", face="bold"))	
+		ggsave("b_distribution_K.png", width = 6, height = 4, dpi = 800)
+
+#	Ru
+	ggplot(data = world) +
+		geom_sf(fill='grey95', color="grey95", ) +
+		geom_sf(data=rivers, color='white') 	+
+		geom_sf(data=lakes, fill='white', color='grey95') +
+		geom_sf(data = bchars_sf, shape=16, size=2, alpha=0.7, aes(color=uppmod_slope))+#,  stroke=event_sd_slope^.5*1.2))	+
+		scale_color_viridis_c(name="Ru",  end=0.9,, na.value="grey95", limits=c(0,7), direction=-1)	+
+#		scale_colour_gradient2(name="Ru",low = "khaki1", high = slpCol, mid='#EE82EE', midpoint=3.5, na.value="grey95", limits=c(0,7))	+
+		coord_sf(crs = st_crs(2163), xlim = c(2580000, -2100000), ylim = c(-2200000, 920000),expand=FALSE)	+
+		#annotation_scale(location = "bl", width_hint = 0.5) +
+		#annotation_north_arrow(location = "bl", which_north = "true", 
+		#	pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+		#	style = north_arrow_fancy_orienteering) +
+		theme(legend.position = c(0.07, 0.22),
+			panel.background=element_rect(fill='white', color='grey95'),
+			panel.grid.major=element_line(color='grey95'),
+			panel.grid.minor=element_line(color='grey95'),
+			legend.background = element_blank(),
+			legend.title = element_text(size=12, color = "grey15", face="bold"))	
+		ggsave("b_distribution_U.png", width = 6, height = 4, dpi = 800)
+
+#	Rl
+	ggplot(data = world) +
+		geom_sf(fill='grey95', color="grey95", ) +
+		geom_sf(data=rivers, color='white') 	+
+		geom_sf(data=lakes, fill='white', color='grey95') +
+		geom_sf(data = bchars_sf, shape=16, size=2, alpha=0.7, aes(color=lowmod_slope))+#,  stroke=event_sd_slope^.5*1.2))	+
+		scale_color_viridis_c(name="Rl",  end=0.9,, na.value="grey95", limits=c(0,7), direction=-1)	+
+#		scale_colour_gradient2(name="Rl",low = "khaki1", high = slpCol, mid='#EE82EE', midpoint=3.5, na.value="grey95", limits=c(0,7))	+
+		coord_sf(crs = st_crs(2163), xlim = c(2580000, -2100000), ylim = c(-2200000, 920000),expand=FALSE)	+
+		#annotation_scale(location = "bl", width_hint = 0.5) +
+		#annotation_north_arrow(location = "bl", which_north = "true", 
+		#	pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+		#	style = north_arrow_fancy_orienteering) +
+		theme(legend.position = c(0.07, 0.22),
+			panel.background=element_rect(fill='white', color='grey95'),
+			panel.grid.major=element_line(color='grey95'),
+			panel.grid.minor=element_line(color='grey95'),
+			legend.background = element_blank(),
+			legend.title = element_text(size=12, color = "grey15", face="bold"))	
+		ggsave("b_distribution_L.png", width = 6, height = 4, dpi = 800)
+
+#	Rjul
+	ggplot(data = world) +
+		geom_sf(fill='grey95', color="grey95", ) +
+		geom_sf(data=rivers, color='white') 	+
+		geom_sf(data=lakes, fill='white', color='grey95') +
+		geom_sf(data = bchars_sf, shape=16, size=2, alpha=0.7, aes(color=dly_med_slope))+#,  stroke=event_sd_slope^.5*1.2))	+
+		scale_color_viridis_c(name="Rday", end=0.9,, na.value="grey95", limits=c(0,7), direction=-1)	+
+#		scale_colour_gradient2(name="Rday",low = "khaki1", high = slpCol, mid='#EE82EE', midpoint=3.5, na.value="grey95", limits=c(0,7))	+
+		coord_sf(crs = st_crs(2163), xlim = c(2580000, -2100000), ylim = c(-2200000, 920000),expand=FALSE)	+
+		#annotation_scale(location = "bl", width_hint = 0.5) +
+		#annotation_north_arrow(location = "bl", which_north = "true", 
+		#	pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+		#	style = north_arrow_fancy_orienteering) +
+		theme(legend.position = c(0.07, 0.22),
+			panel.background=element_rect(fill='white', color='grey95'),
+			panel.grid.major=element_line(color='grey95'),
+			panel.grid.minor=element_line(color='grey95'),
+			legend.background = element_blank(),
+			legend.title = element_text(size=12, color = "grey15", face="bold"))	
+		ggsave("b_distribution_Jul.png", width = 6, height = 4, dpi = 800)
+
+#	Rmed
+	ggplot(data = world) +
+		geom_sf(fill='grey95', color="grey95", ) +
+		geom_sf(data=rivers, color='white') 	+
+		geom_sf(data=lakes, fill='white', color='grey95') +
+		geom_sf(data = bchars_sf, shape=16, size=2, alpha=0.7, aes(color=event_med_slope))+#,  stroke=event_sd_slope^.5*1.2))	+
+		scale_color_viridis_c(name="Rmed",  end=0.9,, na.value="grey95", limits=c(0,7), direction=-1)	+
+#		scale_colour_gradient2(name="Rmed",low = "khaki1", mid = '#EE82EE', high=slpCol, midpoint=3.5, na.value="grey95", limits=c(0,7))	+
+		coord_sf(crs = st_crs(2163), xlim = c(2580000, -2100000), ylim = c(-2200000, 920000),expand=FALSE)	+
+		#annotation_scale(location = "bl", width_hint = 0.5) +
+		#annotation_north_arrow(location = "bl", which_north = "true", 
+		#	pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+		#	style = north_arrow_fancy_orienteering) +
+		theme(legend.position = c(0.07, 0.22),
+			panel.background=element_rect(fill='white', color='grey95'),
+			panel.grid.major=element_line(color='grey95'),
+			panel.grid.minor=element_line(color='grey95'),
+			legend.background = element_blank(),
+			legend.title = element_text(size=12, color = "grey15", face="bold"))	
+		ggsave("b_distribution_Rmed.png", width = 6, height = 4, dpi = 800)
+
+#	curvature
+	more_concav = which(bchars_sf$tot_convex < bchars_sf$tot_concav)
+	bchars_sf_more_concav = bchars_sf[more_concav,]
+	
+	ggplot(data = world) +
+		geom_sf(fill='grey95', color="grey95", ) +
+		geom_sf(data=rivers, color='white') 	+
+		geom_sf(data=lakes, fill='white', color='grey95') +
+		geom_sf(data = bchars_sf, size=2, alpha=0.7, shape=16,
+			aes(color=100*tot_convex / tot_events))		+#,  stroke=event_sd_slope^.5*1.2))	+
+		geom_sf(data = bchars_sf_more_concav, size=2, alpha=0.7, shape=1, stroke=1.5, color='black')		+#,  stroke=event_sd_slope^.5*1.2))	+
+		scale_colour_gradient(name="% Convex",low = "khaki1", high = 'red4', na.value="grey95")	+
+		coord_sf(crs = st_crs(2163), xlim = c(2580000, -2100000), ylim = c(-2200000, 920000),expand=FALSE)	+
+		#annotation_scale(location = "bl", width_hint = 0.5) +
+		#annotation_north_arrow(location = "bl", which_north = "true", 
+		#	pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+		#	style = north_arrow_fancy_orienteering) +
+		theme(legend.position = c(0.09, 0.21),
+			panel.background=element_rect(fill='white', color='grey95'),
+			panel.grid.major=element_line(color='grey95'),
+			panel.grid.minor=element_line(color='grey95'),
+			legend.background = element_blank(),
+			legend.title = element_text(size=12, color = "grey15", face="bold"))	
+		ggsave("Convexity_distribution.png", width = 6, height = 4, dpi = 1200)
+	
+		
+		
+		
+		
+		
+		
+########################################################################################
+#######Hydrologic landscape region boxplot for reviewer, new figure 11
+#######################################################################################
+
+
+bchars_newcoords = st_transform(x = bchars_sf, crs = 2163)
+long_coords = st_coordinates(bchars_newcoords)[,1]
+lat_coords = st_coordinates(bchars_newcoords)[,2]
+bchars_newcoords$long_coords = long_coords
+bchars_newcoords$lat_coords = lat_coords
+bchars_newcoords$pct_convex = bchars_newcoords$tot_convex / bchars_newcoords$tot_events
+
+#setwd("~")
+#write.csv(bchars_newcoords, "recess_data_reprojected.csv")
+#bchars_sf = read.csv("recess_data_reprojected.csv")
+bchars_sf = bchars_newcoords			# changing file name to prevent rewrite
+
+
+	# for uploading the Hydrologic Landscape Regions .shp file, then merging with recession data
+setwd("~\\HydrologicLandscapeRegions_Wolock\\hlrshape")
+aqs = read_sf("hlrus.shp")
+bchars_aqs = st_intersection(bchars_newcoords, aqs)
+
+	# returning to parent directory
+setwd("~")
+png(paste0("HLR_boxplot.png"), width=1024, height=512)
+ggplot(data=bchars_aqs, aes(x=factor(HLR), y=pct_convex*100))	+
+	geom_boxplot(notch=FALSE, lwd=2)	+
+	 scale_y_continuous(limits=c(0, 100), expand = c(0, 0)) +
+	labs(x="HLR code", y='% convex')	+
+	theme(axis.title.x=element_text(face='bold', size=35, colour='grey20'),
+		axis.title.y=element_text(face='bold', size=35, colour='grey20'),
+		axis.text.x=element_text(face='bold', size=28),
+		axis.text.y=element_text(face='bold', size=28),
+		axis.line = element_line(colour = "grey30", size = 1, linetype = "solid"),
+		axis.ticks=element_line(colour='grey30', size=1),
+		panel.background=element_rect(fill='white', color='grey90'),
+		panel.grid.major=element_line(color='grey90'),
+		panel.grid.minor=element_line(color='grey90'),
+		plot.margin=unit(c(2,2,2,2),"cm"))
+dev.off()
+
+png(paste0("HLR_boxplot_b.png"), width=1024, height=512)
+ggplot(data=bchars_aqs, aes(x=factor(HLR), y=event_med_slope))	+
+	geom_boxplot(notch=FALSE, lwd=2)	+
+#	 scale_y_continuous(limits=c(0, 100), expand = c(0, 0)) +
+	labs(x="HLR code", y='Rmed b')	+
+	theme(axis.title.x=element_text(face='bold', size=35, colour='grey20'),
+		axis.title.y=element_text(face='bold', size=35, colour='grey20'),
+		axis.text.x=element_text(face='bold', size=28),
+		axis.text.y=element_text(face='bold', size=28),
+		axis.line = element_line(colour = "grey30", size = 1, linetype = "solid"),
+		axis.ticks=element_line(colour='grey30', size=1),
+		panel.background=element_rect(fill='white', color='grey90'),
+		panel.grid.major=element_line(color='grey90'),
+		panel.grid.minor=element_line(color='grey90'),
+		plot.margin=unit(c(2,2,2,2),"cm"))
+dev.off()
